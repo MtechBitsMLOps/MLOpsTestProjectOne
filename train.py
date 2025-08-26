@@ -1,384 +1,162 @@
 #!/usr/bin/env python3
 """
-train.py — a drop‑in training script for any ML repo.
+MLOps-compatible training script.
 
-Features
-- Data source, target, model, and outputs are driven by environment variables (see below)
-- Handles both classification and regression (auto‑detect or force via env)
-- Robust preprocessing with sklearn Pipelines (impute + scale + one‑hot)
-- Metrics computed and written to JSON; also printed to STDOUT as a single JSON line
-- Saves trained pipeline (preprocess + estimator) to a single joblib artifact
-- Minimal dependencies: pandas, numpy, scikit‑learn, joblib
-
-Environment variables (all prefixed MLOPS_)
-- DATA_PATH: path to CSV file. If omitted, uses sklearn toy datasets.
-- TARGET: target column name (required if DATA_PATH provided).
-- FEATURES: comma‑separated feature column names to select (optional).
-- ID_COLUMN: column to drop (id/index) if present (optional).
-- TASK: one of {auto, classification, regression}. Default: auto.
-- MODEL_TYPE: estimator to use; classification: {logreg, rf, svm}; regression: {linreg, rf, svr}. Default depends on TASK.
-- PARAMS: JSON string of model hyperparameters, e.g. '{"n_estimators":200}'.
-- TEST_SIZE: float in (0,1). Default: 0.2
-- RANDOM_STATE: int. Default: 42
-- STANDARDIZE: bool ("1"/"true"/"yes"). Default: true for linear/svm, false for rf.
-- MAX_SAMPLES: int to downsample rows (useful for quick runs). Optional.
-- METRICS_FILE: path to write metrics JSON. Default: ./artifacts/metrics.json
-- MODEL_FILE: path to write trained pipeline. Default: ./artifacts/model.joblib
-- TAGS: optional comma‑separated run tags; stored in metrics JSON only.
-- RUN_ID: optional run identifier; stored in metrics JSON only.
-
-Example
-$ export MLOPS_DATA_PATH=data/iris.csv
-$ export MLOPS_TARGET=species
-$ python train.py
-
-This prints a single JSON line to STDOUT with key metrics and writes artifacts/metrics.json and artifacts/model.joblib by default.
+- Reads environment variables (MLOPS_*)
+- Handles headerless CSVs with default column names
+- Timestamped artifact directories
+- Supports classification and regression tasks
 """
 
-from __future__ import annotations
-import json
 import os
 import sys
-from dataclasses import dataclass
+import json
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 
-import numpy as np
 import pandas as pd
-from joblib import dump
-
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
+import joblib
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-    confusion_matrix,
-    r2_score,
-    mean_absolute_error,
-    mean_squared_error,
-)
-
+from sklearn.metrics import accuracy_score, r2_score, mean_squared_error, mean_absolute_error
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.svm import SVC, SVR
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# Default columns if CSV has no header
+DEFAULT_COLUMNS = ["sepal_length", "sepal_width", "petal_length", "petal_width", "target"]
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(f"MLOPS_{name}", default)
 
 
-def _as_bool(value: Optional[str], default: bool = False) -> bool:
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "y"}
-
-
-def _json_or_none(value: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not value:
-        return None
+# -----------------------------
+# Load data
+# -----------------------------
+def load_data(csv_path: Path, features: list[str], target: str):
+    """Load dataset from CSV and handle headerless CSVs if necessary."""
     try:
-        return json.loads(value)
-    except Exception:
-        print(f"Warning: could not parse JSON from PARAMS: {value}", file=sys.stderr)
-        return None
+        df = pd.read_csv(csv_path)
+        if set(DEFAULT_COLUMNS).issubset(range(df.shape[1])) or df.columns.tolist() == list(range(df.shape[1])):
+            df = pd.read_csv(csv_path, header=None, names=DEFAULT_COLUMNS)
 
+        missing = [f for f in features + [target] if f not in df.columns]
+        if missing:
+            raise ValueError(f"Missing columns in data: {missing}")
 
-@dataclass
-class Config:
-    data_path: Optional[str]
-    target: Optional[str]
-    features: Optional[List[str]]
-    id_column: Optional[str]
-    task: str
-    model_type: Optional[str]
-    params: Dict[str, Any]
-    test_size: float
-    random_state: int
-    standardize: Optional[bool]
-    max_samples: Optional[int]
-    metrics_file: Path
-    model_file: Path
-    tags: List[str]
-    run_id: Optional[str]
+        return df[features], df[target]
 
-    @staticmethod
-    def from_env() -> "Config":
-        data_path = _env("DATA_PATH")
-        target = _env("TARGET")
-        features = _env("FEATURES")
-        features_list = [c.strip() for c in features.split(",")] if features else None
-        id_column = _env("ID_COLUMN")
-        task = (_env("TASK", "auto") or "auto").lower()
-        model_type = _env("MODEL_TYPE")
-        params = _json_or_none(_env("PARAMS")) or {}
-        test_size = float(_env("TEST_SIZE", "0.2"))
-        random_state = int(_env("RANDOM_STATE", "42"))
-        standardize_env = _env("STANDARDIZE")
-        standardize = None if standardize_env is None else _as_bool(standardize_env)
-        max_samples_env = _env("MAX_SAMPLES")
-        max_samples = int(max_samples_env) if max_samples_env else None
-        metrics_file = Path(_env("METRICS_FILE", "./artifacts/metrics.json"))
-        model_file = Path(_env("MODEL_FILE", "./artifacts/model.joblib"))
-        tags = [t.strip() for t in (_env("TAGS") or "").split(",") if t.strip()]
-        run_id = _env("RUN_ID")
-        return Config(
-            data_path,
-            target,
-            features_list,
-            id_column,
-            task,
-            model_type,
-            params,
-            test_size,
-            random_state,
-            standardize,
-            max_samples,
-            metrics_file,
-            model_file,
-            tags,
-            run_id,
-        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to load data from {csv_path}: {e}") from e
 
 
 # -----------------------------
-# Data loading
+# Model selection
 # -----------------------------
-
-def load_data(cfg: Config) -> Tuple[pd.DataFrame, pd.Series]:
-    if cfg.data_path:
-        if not cfg.target:
-            raise ValueError("MLOPS_TARGET must be set when using MLOPS_DATA_PATH")
-        df = pd.read_csv(cfg.data_path)
-        if cfg.id_column and cfg.id_column in df.columns:
-            df = df.drop(columns=[cfg.id_column])
-        if cfg.features:
-            missing = [c for c in cfg.features if c not in df.columns]
-            if missing:
-                raise ValueError(f"Requested FEATURES not in data columns: {missing}")
-            X = df[cfg.features].copy()
-        else:
-            X = df.drop(columns=[cfg.target]).copy()
-        y = df[cfg.target].copy()
-        return X, y
-
-    # Fallback toy datasets for quick smoke tests
-    from sklearn.datasets import load_iris, load_diabetes
-    if cfg.task in ("auto", "classification"):
-        iris = load_iris(as_frame=True)
-        X = iris.data
-        y = iris.target
-        return X, y
-    else:
-        diab = load_diabetes(as_frame=True)
-        X = diab.data
-        y = diab.target
-        return X, y
-
-
-# -----------------------------
-# Task detection & model selection
-# -----------------------------
-
-def detect_task(y: pd.Series, requested: str) -> str:
-    if requested != "auto":
-        return requested
-    # Heuristic: numeric with many unique values -> regression; else classification
-    if pd.api.types.is_numeric_dtype(y) and y.nunique(dropna=True) > 20:
-        return "regression"
-    return "classification"
-
-
-def make_estimator(task: str, model_type: Optional[str], params: Dict[str, Any]) -> Any:
+def make_estimator(task: str, model_type: str, params: dict):
+    task = task.lower()
+    model_type = model_type.lower() if model_type else None
     if task == "classification":
-        kind = (model_type or "logreg").lower()
-        if kind == "rf":
+        if model_type == "rf":
             return RandomForestClassifier(random_state=params.pop("random_state", None), **params)
-        if kind == "svm" or kind == "svc":
+        if model_type in {"svc", "svm"}:
             return SVC(probability=True, **params)
-        # default
         return LogisticRegression(max_iter=1000, **params)
     else:
-        kind = (model_type or "linreg").lower()
-        if kind == "rf":
+        if model_type == "rf":
             return RandomForestRegressor(random_state=params.pop("random_state", None), **params)
-        if kind == "svr" or kind == "svm":
+        if model_type in {"svr", "svm"}:
             return SVR(**params)
-        # default
         return LinearRegression(**params)
 
 
 # -----------------------------
-# Preprocessing pipeline
+# Train and evaluate
 # -----------------------------
-
-def build_pipeline(X: pd.DataFrame, estimator: Any, standardize: Optional[bool]) -> Pipeline:
-    numeric_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
-    categorical_cols = [c for c in X.columns if c not in numeric_cols]
-
-    # Decide default standardization behavior based on estimator type if None
-    if standardize is None:
-        needs_scale = any(name in estimator.__class__.__name__.lower() for name in ["logistic", "svc", "svr", "linear"])
-        standardize = bool(needs_scale)
-
-    num_steps = [("imputer", SimpleImputer(strategy="median"))]
-    if standardize:
-        num_steps.append(("scaler", StandardScaler()))
-
-    cat_steps = [
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-    ]
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", Pipeline(steps=num_steps), numeric_cols),
-            ("cat", Pipeline(steps=cat_steps), categorical_cols),
-        ],
-        remainder="drop",
-        verbose_feature_names_out=False,
+def train_and_evaluate(X, y, estimator, test_size: float, random_state: int, task: str):
+    stratify = y if task.lower() == "classification" else None
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=stratify
     )
+    estimator.fit(X_train, y_train)
+    y_pred = estimator.predict(X_test)
 
-    pipe = Pipeline([
-        ("preprocess", preprocessor),
-        ("model", estimator),
-    ])
-    return pipe
-
-
-# -----------------------------
-# Metrics
-# -----------------------------
-
-def compute_metrics(task: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[np.ndarray] = None) -> Dict[str, Any]:
-    if task == "classification":
-        out: Dict[str, Any] = {
-            "accuracy": float(accuracy_score(y_true, y_pred)),
-            "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
-            "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-            "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-            "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
-        }
-        # ROC-AUC (binary only)
-        try:
-            if y_proba is not None and (y_proba.shape[1] == 2 or y_proba.ndim == 1):
-                proba = y_proba[:, 1] if y_proba.ndim == 2 else y_proba
-                out["roc_auc"] = float(roc_auc_score(y_true, proba))
-        except Exception:
-            pass
-        return out
+    metrics = {}
+    if task.lower() == "classification":
+        metrics["accuracy"] = float(accuracy_score(y_test, y_pred))
     else:
-        rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-        return {
-            "r2": float(r2_score(y_true, y_pred)),
-            "mae": float(mean_absolute_error(y_true, y_pred)),
-            "rmse": rmse,
-        }
+        metrics["r2"] = float(r2_score(y_test, y_pred))
+        metrics["mae"] = float(mean_absolute_error(y_test, y_pred))
+        metrics["rmse"] = float(mean_squared_error(y_test, y_pred, squared=False))
+
+    return estimator, metrics
 
 
 # -----------------------------
-# I/O helpers
+# Save artifacts
 # -----------------------------
+def save_artifacts(model, metrics, model_file_env: str, metrics_file_env: str):
+    """Save model and metrics in timestamped subdirectories under the specified base paths."""
+    timestamp = datetime.now().strftime("%d%m%y_%H%M%S")
 
-def ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Model path
+    model_base = Path(model_file_env)
+    model_dir = model_base.parent / datetime.now().strftime("%d%m%y") if model_base.suffix else model_base / datetime.now().strftime("%d%m%y")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_file = model_dir / f"model_{timestamp}.joblib"
+    joblib.dump(model, model_file)
 
+    # Metrics path
+    metrics_base = Path(metrics_file_env)
+    metrics_dir = metrics_base.parent / datetime.now().strftime("%d%m%y") if metrics_base.suffix else metrics_base / datetime.now().strftime("%d%m%y")
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    metrics_file = metrics_dir / f"metrics_{timestamp}.json"
+    with open(metrics_file, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
 
-def write_json(path: Path, payload: Dict[str, Any]) -> None:
-    ensure_parent(path)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
+    return model_file, metrics_file
 
 
 # -----------------------------
 # Main
 # -----------------------------
+def main():
+    try:
+        # Environment variables
+        data_path = Path(_env("DATA_PATH", "iris.csv"))
+        target = _env("TARGET", "species")
+        features_env = _env("FEATURES")
+        features_list = [f.strip() for f in features_env.split(",")] if features_env else DEFAULT_COLUMNS[:-1]
+        task = _env("TASK", "classification")
+        model_type = _env("MODEL_TYPE", None)
+        params = json.loads(_env("PARAMS", "{}"))
+        test_size = float(_env("TEST_SIZE", 0.2))
+        random_state = int(_env("RANDOM_STATE", 42))
+        model_file_env = _env("MODEL_FILE", "./artifacts/model.joblib")
+        metrics_file_env = _env("METRICS_FILE", "./artifacts/metrics.json")
 
-def main() -> int:
-    cfg = Config.from_env()
+        # Load data
+        X, y = load_data(data_path, features_list, target)
 
-    # Load data
-    X, y = load_data(cfg)
+        # Train model
+        estimator = make_estimator(task, model_type, params)
+        estimator, metrics = train_and_evaluate(X, y, estimator, test_size, random_state, task)
 
-    # Optional subsample for quick runs
-    if cfg.max_samples and len(X) > cfg.max_samples:
-        X = X.sample(cfg.max_samples, random_state=cfg.random_state)
-        y = y.loc[X.index]
+        # Save artifacts
+        model_file, metrics_file = save_artifacts(estimator, metrics, model_file_env, metrics_file_env)
 
-    # Detect task and choose estimator
-    task = detect_task(y, cfg.task)
-    estimator = make_estimator(task, cfg.model_type, cfg.params.copy())
+        # Output JSON for CLI capture
+        print(json.dumps({"metrics": metrics, "model_file": str(model_file), "metrics_file": str(metrics_file)}))
 
-    # Build pipeline
-    pipe = build_pipeline(X, estimator, cfg.standardize)
-
-    # Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=cfg.test_size, random_state=cfg.random_state, stratify=y if task == "classification" else None
-    )
-
-    # Fit
-    pipe.fit(X_train, y_train)
-
-    # Predict
-    y_pred = pipe.predict(X_test)
-    y_proba = None
-    if task == "classification":
-        # Try to get probabilities if available
-        try:
-            if hasattr(pipe.named_steps["model"], "predict_proba"):
-                y_proba = pipe.predict_proba(X_test)
-        except Exception:
-            y_proba = None
-
-    # Metrics
-    metrics = compute_metrics(task, y_test.to_numpy(), y_pred, y_proba)
-
-    # Assemble run report
-    report = {
-        "run_id": cfg.run_id,
-        "tags": cfg.tags,
-        "task": task,
-        "model_type": (cfg.model_type or ("logreg" if task == "classification" else "linreg")),
-        "params": cfg.params,
-        "random_state": cfg.random_state,
-        "test_size": cfg.test_size,
-        "n_train": int(len(X_train)),
-        "n_test": int(len(X_test)),
-        "metrics": metrics,
-        "feature_columns": list(X.columns),
-        "artifacts": {
-            "model_file": str(cfg.model_file),
-            "metrics_file": str(cfg.metrics_file),
-        },
-    }
-
-    # Persist artifacts
-    ensure_parent(cfg.model_file)
-    dump(pipe, cfg.model_file)
-
-    write_json(cfg.metrics_file, report)
-
-    # Emit a single JSON line to STDOUT for easy CLI scraping
-    print(json.dumps(report, separators=(",", ":")))
-
-    return 0
+    except Exception as e:
+        print(json.dumps({"error": str(e), "type": type(e).__name__}), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as e:
-        # Print a structured error so CLIs can parse it
-        err = {"error": str(e), "type": e.__class__.__name__}
-        print(json.dumps(err, separators=(",", ":")), file=sys.stderr)
-        raise
+    main()
