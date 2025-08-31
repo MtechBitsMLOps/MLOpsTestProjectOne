@@ -26,8 +26,11 @@ def main(config: Path = typer.Option(..., help="Path to JSON config")):
     models_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resolve dataset path relative to config file
+    data_path = (config.parent / params["data_path"]).resolve()
+
     # Load dataset
-    df = pd.read_csv(params["data_path"])
+    df = pd.read_csv(data_path)
 
     # Drop empty rows if any
     df = df.dropna()
