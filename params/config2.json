@@ -1,0 +1,9 @@
+{
+  "project_path": "{{cwd}}",
+  "data_path": "../data/iris.csv",
+  "test_size": 0.25,
+  "random_state": 123,
+  "max_iter": 300,
+  "C": 0.5,
+  "solver": "lbfgs"
+}
